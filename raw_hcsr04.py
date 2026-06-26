@@ -87,9 +87,9 @@ def main():
     for i in range(20):
         pulse, dist_cm = ping()
         if pulse == -1:
-            print(f"  {i+1:2d}: OUT        (timeout or noise)")
-        else:
-            print(f"  {i+1:2d}: {pulse:5d} µs  →  {dist_cm:6.2f} cm")
+print(f"  {i+1:2d}: OUT        (timeout or noise)")
+            else:
+                print(f"  {i+1:2d}: {int(pulse):5d} µs  →  {dist_cm:6.2f} cm")
         time.sleep(0.05)
 
     # Stats
