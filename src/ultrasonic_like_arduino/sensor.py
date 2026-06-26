@@ -159,26 +159,43 @@ class UltrasonicSensor:
         Records precise timestamps on ACTUAL rising/falling edges of the
         echo pin. Ignores repeated messages where the pin hasn't changed
         (which happen because DIGITAL_MESSAGE covers all 8 port pins).
+
+        .. warning::
+
+           Any exception raised here will kill the Iterator thread that
+           processes incoming serial data, permanently disabling all
+           callbacks. The try/except is intentional and critical.
         """
-        with self._cb_lock:
-            # Only act on real state transitions.
-            if value == 1 and self._prev_echo_value == 0:
-                # Rising edge → echo pulse started.
-                self._echo_high_time = time.perf_counter()
-            elif value == 0 and self._prev_echo_value == 1:
-                # Falling edge → echo pulse ended.
-                self._echo_low_time = time.perf_counter()
-                self._measurement_done.set()
-            self._prev_echo_value = value
+        try:
+            with self._cb_lock:
+                # Only act on real state transitions.
+                if value == 1 and self._prev_echo_value == 0:
+                    # Rising edge → echo pulse started.
+                    self._echo_high_time = time.perf_counter()
+                elif value == 0 and self._prev_echo_value == 1:
+                    # Falling edge → echo pulse ended.
+                    self._echo_low_time = time.perf_counter()
+                    self._measurement_done.set()
+                self._prev_echo_value = value
+        except Exception:
+            # If we don't catch this, the PyFirmata2 Iterator thread dies
+            # silently and all future callbacks stop working.
+            pass
 
     def _send_trigger_pulse(self):
         """Send the trigger pulse to start a measurement.
 
         The HC-SR04 needs a minimum 10 µs HIGH pulse on TRIG.
-        With Firmata's serial latency the pulse will be ~1-5 ms,
-        which is well within the sensor's tolerance.
+        This method ensures a clean pulse by:
+        1. Starting from a known LOW state
+        2. Waiting 1 ms so the Arduino processes the LOW
+        3. Sending HIGH for 10 ms (guarantees the sensor sees it)
+        4. Returning to LOW
         """
+        self._trig.write(0)
+        time.sleep(0.001)  # 1 ms settle
         self._trig.write(1)
+        time.sleep(0.010)  # 10 ms pulse (well above 10 µs min)
         self._trig.write(0)
 
     # ------------------------------------------------------------------
