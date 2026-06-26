@@ -1,49 +1,40 @@
 import time
 import statistics
+import threading
 
 import ultrasonic_like_arduino.board as board_module
-from .exceptions import SensorNotAttachedError, MeasurementTimeoutError, InvalidUnitError
+from .exceptions import SensorNotAttachedError, InvalidUnitError
 
-
-# Speed of sound in various units (cm per microsecond at 20°C).
-# Speed of sound = 343 m/s = 34300 cm/s = 0.0343 cm/µs
-# Round-trip distance = time * speed / 2
-_SOUND_SPEED = {
-    'cm': 0.0343,       # cm/µs  → distance(cm) = pulse(µs) * 0.0343 / 2
-    'mm': 0.343,        # mm/µs
-    'm':  0.000343,     # m/µs
-    'in': 0.0135,       # in/µs  (1 in = 2.54 cm)
-}
 
 # Conversion factor: pulse_duration(µs) * SPEED_OF_SOUND / 2  = distance
-# Pre-computed as pulse_duration * factor = distance
+# Speed of sound = 34300 cm/s = 0.0343 cm/µs
+# distance(cm) = pulse(µs) * 0.0343 / 2 = pulse * 0.01715
 _DISTANCE_FACTOR = {
-    'cm': 0.0343 / 2,    # = 0.01715
-    'mm': 0.343 / 2,     # = 0.1715
-    'm':  0.000343 / 2,  # = 0.0001715
-    'in': 0.0135 / 2,    # = 0.00675
+    'cm': 0.0343 / 2,    # 0.01715
+    'mm': 0.343 / 2,     # 0.1715
+    'm':  0.000343 / 2,  # 0.0001715
+    'in': 0.0135 / 2,    # 0.00675
 }
 
-# Maximum reasonable timeout for HC-SR04 (400 cm range).
-# Round-trip time at 400 cm = 2 * 400 / 34300 = ~0.0233 s = 23.3 ms
+# Round-trip time at 400 cm = 2 * 400 / 34300 = ~0.0233 s
 # Add margin for safety.
-_MAX_TIMEOUT_SECONDS = 0.05  # 50 ms
+_MAX_TIMEOUT_SECONDS = 0.10  # 100 ms
 
 
 class UltrasonicSensor:
     """Represents an HC-SR04 (or compatible) ultrasonic distance sensor.
 
     Uses an Arduino running StandardFirmata via PyFirmata2. The sensor
-    measures distance by sending a 10 µs pulse on the *trig* pin and
-    timing the echo pulse on the *echo* pin.
+    measures distance by sending a pulse on the *trig* pin and
+    timing the echo pulse on the *echo* pin via digital pin callbacks.
 
     **Usage**::
 
         from ultrasonic_like_arduino import Board, UltrasonicSensor
 
-        board = Board("COM3")
+        board = Board("/dev/ttyUSB0")
         sensor = UltrasonicSensor()
-        sensor.attach(trig=9, echo=10)
+        sensor.attach(trig=7, echo=8)
 
         dist = sensor.read()         # distance in cm
         dist = sensor.read('in')     # distance in inches
@@ -66,10 +57,17 @@ class UltrasonicSensor:
         self.echo_pin = None
         self.max_distance = max_distance
         self._timeout = min(
-            (2 * max_distance) / 34300 + 0.005,  # round-trip time + 5 ms margin
+            (2 * max_distance) / 34300 + 0.01,  # round-trip + 10 ms margin
             _MAX_TIMEOUT_SECONDS
         )
         self._last_distance = None
+
+        # Callback-based timing state (thread-safe)
+        self._cb_lock = threading.Lock()
+        self._echo_high_time = None
+        self._echo_low_time = None
+        self._measurement_done = threading.Event()
+        self._old_callback = None  # store previous callback if any
 
     # ------------------------------------------------------------------
     # Attach / detach
@@ -102,6 +100,14 @@ class UltrasonicSensor:
         # ECHO → digital input (enables port reporting for this pin)
         self._echo = board._board.get_pin(f"d:{echo}:i")
 
+        # Register our callback on the echo pin.
+        # The callback fires from the sampler thread when a DIGITAL_MESSAGE
+        # updates this pin's value. We capture timestamps here because
+        # they're much closer to the actual pin transition than polling
+        # from the main thread.
+        self._old_callback = self._echo.callback
+        self._echo.register_callback(self._echo_callback)
+
         # Start the sampler thread so pin values update asynchronously.
         if hasattr(board._board, 'samplerThread'):
             board._board.samplingOn(1)  # 1 ms sampling interval
@@ -112,6 +118,12 @@ class UltrasonicSensor:
         After calling this, the sensor must be re-attached before
         further readings.
         """
+        if self._echo is not None:
+            # Restore old callback (or None)
+            self._echo.unregiser_callback()
+            if self._old_callback is not None:
+                self._echo.register_callback(self._old_callback)
+            self._old_callback = None
         self._trig = None
         self._echo = None
         self.trig_pin = None
@@ -138,10 +150,27 @@ class UltrasonicSensor:
                 "Sensor not attached. Call attach(trig, echo) first."
             )
 
+    def _echo_callback(self, value):
+        """Called from the sampler thread when the echo pin value changes.
+
+        Records precise timestamps used to calculate the echo pulse width.
+        """
+        with self._cb_lock:
+            if value == 1:
+                # ECHO just went HIGH → mark the start of the echo pulse
+                self._echo_high_time = time.perf_counter()
+            else:
+                # ECHO just went LOW → mark the end
+                self._echo_low_time = time.perf_counter()
+                self._measurement_done.set()
+
     def _send_trigger_pulse(self):
-        """Send the 10 µs trigger pulse to start a measurement."""
-        # Ensure the pin starts LOW.
-        self._trig.write(0)
+        """Send the trigger pulse to start a measurement.
+
+        The HC-SR04 needs a minimum 10 µs HIGH pulse on TRIG.
+        With Firmata's serial latency the pulse will be ~1-5 ms,
+        which is well within the sensor's tolerance.
+        """
         self._trig.write(1)
         self._trig.write(0)
 
@@ -152,7 +181,10 @@ class UltrasonicSensor:
     def ping(self):
         """Measure the echo pulse duration in microseconds.
 
-        This is analogous to Arduino's ``pulseIn()``.
+        Uses PyFirmata2's pin callback mechanism for accurate timing.
+        The callback fires from the sampler thread when the Arduino
+        reports a digital port state change, capturing timestamps
+        close to the actual pin transitions.
 
         Returns
         -------
@@ -167,33 +199,31 @@ class UltrasonicSensor:
         """
         self._ensure_attached()
 
+        # Prepare for a new measurement.
+        with self._cb_lock:
+            self._echo_high_time = None
+            self._echo_low_time = None
+        self._measurement_done.clear()
+
         # Send the trigger pulse.
         self._send_trigger_pulse()
 
-        # Record the time just after the trigger.
-        pulse_start = time.perf_counter()
+        # Wait until the callback signals that ECHO went LOW,
+        # or until timeout.
+        got_measurement = self._measurement_done.wait(timeout=self._timeout)
 
-        # --- Wait for ECHO to go HIGH (with timeout) ---
-        timeout_end = time.perf_counter() + self._timeout
-        while time.perf_counter() < timeout_end:
-            # The sampler thread updates _echo.value asynchronously.
-            if self._echo.value == 1:
-                pulse_start = time.perf_counter()
-                break
-        else:
-            # Timeout — no echo received.
-            return -1
+        with self._cb_lock:
+            if got_measurement and self._echo_high_time is not None and self._echo_low_time is not None:
+                # Both timestamps captured — calculate pulse width.
+                pulse_duration = (self._echo_low_time - self._echo_high_time) * 1_000_000  # seconds → µs
+                if pulse_duration > 0:
+                    self._last_distance = pulse_duration * _DISTANCE_FACTOR['cm']
+                    return max(1, int(pulse_duration))
 
-        # --- Wait for ECHO to go LOW (with timeout) ---
-        timeout_end = time.perf_counter() + self._timeout
-        while time.perf_counter() < timeout_end:
-            if self._echo.value == 0:
-                pulse_end = time.perf_counter()
-                pulse_duration = (pulse_end - pulse_start) * 1_000_000  # seconds → µs
-                self._last_distance = pulse_duration * _DISTANCE_FACTOR['cm']
-                return int(pulse_duration)
-        else:
-            # Echo stayed HIGH too long — out of range.
+            # If echo_high_time is set but echo_low_time is not,
+            # ECHO went HIGH but never came LOW (stuck high or timeout).
+            # If echo_high_time is None, the trigger pulse may not have
+            # been received, or the sensor isn't responding.
             return -1
 
     def read(self, unit='cm'):

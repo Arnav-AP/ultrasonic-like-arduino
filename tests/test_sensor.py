@@ -46,6 +46,12 @@ def mock_pyfirmata2(monkeypatch):
         def disable_reporting(self):
             self.reporting = False
 
+        def register_callback(self, cb):
+            self.callback = cb
+
+        def unregiser_callback(self):
+            self.callback = None
+
     def mock_get_pin(pin_def):
         return MockPin(pin_def)
 
