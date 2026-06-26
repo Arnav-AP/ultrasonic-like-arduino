@@ -66,8 +66,11 @@ class UltrasonicSensor:
         self._cb_lock = threading.Lock()
         self._echo_high_time = None
         self._echo_low_time = None
+        self._prev_echo_value = None    # track previous state for edge detection
         self._measurement_done = threading.Event()
         self._old_callback = None  # store previous callback if any
+        # Minimum valid distance in cm (reject noise below this).
+        self._min_distance = 2
 
     # ------------------------------------------------------------------
     # Attach / detach
@@ -151,18 +154,22 @@ class UltrasonicSensor:
             )
 
     def _echo_callback(self, value):
-        """Called from the sampler thread when the echo pin value changes.
+        """Called from the sampler thread when a digital port message arrives.
 
-        Records precise timestamps used to calculate the echo pulse width.
+        Records precise timestamps on ACTUAL rising/falling edges of the
+        echo pin. Ignores repeated messages where the pin hasn't changed
+        (which happen because DIGITAL_MESSAGE covers all 8 port pins).
         """
         with self._cb_lock:
-            if value == 1:
-                # ECHO just went HIGH → mark the start of the echo pulse
+            # Only act on real state transitions.
+            if value == 1 and self._prev_echo_value == 0:
+                # Rising edge → echo pulse started.
                 self._echo_high_time = time.perf_counter()
-            else:
-                # ECHO just went LOW → mark the end
+            elif value == 0 and self._prev_echo_value == 1:
+                # Falling edge → echo pulse ended.
                 self._echo_low_time = time.perf_counter()
                 self._measurement_done.set()
+            self._prev_echo_value = value
 
     def _send_trigger_pulse(self):
         """Send the trigger pulse to start a measurement.
@@ -199,10 +206,11 @@ class UltrasonicSensor:
         """
         self._ensure_attached()
 
-        # Prepare for a new measurement.
+        # Prepare for a new measurement: reset all tracking state.
         with self._cb_lock:
             self._echo_high_time = None
             self._echo_low_time = None
+            self._prev_echo_value = None
         self._measurement_done.clear()
 
         # Send the trigger pulse.
@@ -217,13 +225,13 @@ class UltrasonicSensor:
                 # Both timestamps captured — calculate pulse width.
                 pulse_duration = (self._echo_low_time - self._echo_high_time) * 1_000_000  # seconds → µs
                 if pulse_duration > 0:
-                    self._last_distance = pulse_duration * _DISTANCE_FACTOR['cm']
+                    distance_cm = pulse_duration * _DISTANCE_FACTOR['cm']
+                    self._last_distance = distance_cm
+                    # Reject readings below minimum distance (electrical noise).
+                    if distance_cm < self._min_distance:
+                        return -1
                     return max(1, int(pulse_duration))
 
-            # If echo_high_time is set but echo_low_time is not,
-            # ECHO went HIGH but never came LOW (stuck high or timeout).
-            # If echo_high_time is None, the trigger pulse may not have
-            # been received, or the sensor isn't responding.
             return -1
 
     def read(self, unit='cm'):
