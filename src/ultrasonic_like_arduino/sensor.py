@@ -195,7 +195,7 @@ class UltrasonicSensor:
         self._trig.write(0)
         time.sleep(0.001)  # 1 ms settle
         self._trig.write(1)
-        time.sleep(0.010)  # 10 ms pulse (well above 10 µs min)
+        time.sleep(0.001)  # 1 ms pulse (100x the 10 µs min)
         self._trig.write(0)
 
     # ------------------------------------------------------------------
