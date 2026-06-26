@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ultrasonic-like-arduino"
+version = "0.1.0"
+description = "Arduino-style HC-SR04 ultrasonic distance sensor control using PyFirmata2"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Arnav-AP"}
+]
+keywords = ["arduino", "ultrasonic", "hc-sr04", "distance", "sensor", "firmata", "pyfirmata2"]
+dependencies = [
+    "pyfirmata2",
+    "pyserial",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
